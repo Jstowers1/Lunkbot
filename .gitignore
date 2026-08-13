@@ -7,6 +7,7 @@ default_responses.json
 custom_domains.json
 response_pool.json
 notify_channels.json
+vc_timeout_map.json
 
 #IDE
 .vscode/

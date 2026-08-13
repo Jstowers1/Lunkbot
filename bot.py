@@ -40,7 +40,7 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
 logging.basicConfig(level=logging.WARNING)
@@ -88,6 +88,30 @@ WAKE_WORDS = [
     ).split(",")
     if w.strip()
 ]
+
+#Voice timeout command: only VC_OWNER_ID can trigger.
+VC_OWNER_ID = int(os.environ.get("VC_OWNER_ID", "0") or "0")
+
+VC_TIMEOUT_DURATION = 60  #seconds
+
+#Runtime name -> user ID map, persisted to JSON
+VC_TIMEOUT_MAP_DB = os.environ.get("VC_TIMEOUT_MAP_DB", "vc_timeout_map.json")
+VC_TIMEOUT_MAP: dict[str, int] = {}
+
+
+def _load_vc_timeout_map():
+    global VC_TIMEOUT_MAP
+    try:
+        with open(VC_TIMEOUT_MAP_DB, "r") as f:
+            raw = json.load(f)
+        VC_TIMEOUT_MAP = {str(k).lower(): int(v) for k, v in raw.items()}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+        VC_TIMEOUT_MAP = {}
+
+
+def _save_vc_timeout_map():
+    with open(VC_TIMEOUT_MAP_DB, "w") as f:
+        json.dump(VC_TIMEOUT_MAP, f)
 
 #Base responses loaded from a gitignored JSON file
 DEFAULT_RESPONSES_DB = os.environ.get("DEFAULT_RESPONSES_DB", "default_responses.json")
@@ -160,6 +184,37 @@ def _fuzzy_wake_match(alnum_text: str) -> bool:
     return False
 
 
+_TIMEOUT_KEYWORDS = ("time", "out", "timed")
+_TIMEOUT_NOISE = {"this", "guy", "the", "a", "an"}
+
+
+def _parse_timeout_target(alnum_text: str) -> int | None:
+    """Parse 'time this X guy out' -> resolve X against VC_TIMEOUT_MAP.
+
+    Returns the mapped Discord user ID, or None if no match.
+    """
+    words = alnum_text.split()
+    has_time = any(w in _TIMEOUT_KEYWORDS for w in words)
+    has_out = "out" in words
+    if not (has_time or has_out):
+        return None
+
+    #Filter noise words; anything remaining is a potential name
+    candidates = [
+        w for w in words
+        if w not in _TIMEOUT_KEYWORDS and w not in _TIMEOUT_NOISE
+    ]
+    for w in candidates:
+        if w in VC_TIMEOUT_MAP:
+            return VC_TIMEOUT_MAP[w]
+    #Fuzzy fallback for misheard names
+    for w in candidates:
+        for name, uid in VC_TIMEOUT_MAP.items():
+            if SequenceMatcher(None, w, name).ratio() >= 0.75:
+                return uid
+    return None
+
+
 class WakeupSink(Sink):
     """Captures per-user PCM audio. When a user stops talking (silence gap),
     the buffered audio is sent to the STT pipeline. If the transcription
@@ -230,12 +285,38 @@ class WakeupSink(Sink):
         if not matched:
             return
 
+        #Timeout command check
+        if user_id == VC_OWNER_ID and VC_TIMEOUT_MAP:
+            target = _parse_timeout_target(alnum)
+            if target:
+                await self._do_timeout(target)
+                return
+
         pool = _full_pool()
         if not pool:
             return
         quote = random.choice(pool)
         quote = _resolve_emojis(quote, None)
         await self._speak(quote)
+
+    async def _do_timeout(self, target_id: int):
+        """Timeout a member for VC_TIMEOUT_DURATION seconds."""
+        vc = _get_voice_client()
+        if vc is None or not vc.is_connected() or vc.channel is None:
+            return
+        guild = vc.channel.guild
+        try:
+            member = await guild.fetch_member(target_id)
+        except discord.NotFound:
+            print(f"Timeout target {target_id} not found in guild.")
+            return
+        until = discord.utils.utcnow() + timedelta(seconds=VC_TIMEOUT_DURATION)
+        try:
+            await member.timeout(until, reason="Voice command by VC owner.")
+        except discord.Forbidden:
+            print("Missing MODERATE_MEMBERS permission for timeout.")
+        except Exception as e:
+            print(f"Timeout failed: {e}")
 
     async def _speak(self, text: str):
         """Generate TTS audio and play it in the VC."""
@@ -357,6 +438,7 @@ async def on_ready():
     _load_default_responses()
     _load_custom_domains()
     _load_user_responses()
+    _load_vc_timeout_map()
     bot.loop.create_task(_parse_quotes_channel())
     bot.loop.create_task(_silence_checker())
     try:
@@ -999,7 +1081,9 @@ async def help_cmd(ctx: discord.ApplicationContext):
         value=(
             "@lunkbot **join vc** — joins your voice channel\n"
             "@lunkbot **leave vc** — leaves the voice channel\n"
-            'Say "**hey lunkbot**" in VC → bot speaks a random quote'
+            'Say "**hey lunkbot**" in VC → bot speaks a random quote\n'
+            'Say "**lunkbot time out <name>**" in VC → times out mapped user (owner-only)\n'
+            "`/timeoutmap add|remove|list` — manage timeout name mappings"
         ),
         inline=False,
     )
@@ -1018,6 +1102,51 @@ async def help_cmd(ctx: discord.ApplicationContext):
         inline=False,
     )
     await ctx.respond(embed=embed)
+
+
+#Timeout map command (owner-only)
+
+@bot.slash_command(name="timeoutmap", description="Manage voice timeout target mappings (owner-only)")
+@option("action", description="add, remove, or list", choices=["add", "remove", "list"])
+@option("name", description="Nickname for the target (required for add/remove)", required=False)
+@option("user", description="The Discord user to map (required for add)", required=False)
+async def timeoutmap_cmd(
+    ctx: discord.ApplicationContext,
+    action: str,
+    name: str | None = None,
+    user: discord.User | None = None,
+):
+    if ctx.user.id != VC_OWNER_ID:
+        await ctx.respond("Not authorized.", ephemeral=True)
+        return
+
+    if action == "list":
+        if not VC_TIMEOUT_MAP:
+            await ctx.respond("Timeout map is empty.")
+            return
+        lines = [f"`{n}` -> <@{uid}>" for n, uid in VC_TIMEOUT_MAP.items()]
+        await ctx.respond("\n".join(lines))
+        return
+
+    if not name:
+        await ctx.respond("Name required for add/remove.", ephemeral=True)
+        return
+    name = name.strip().lower()
+
+    if action == "add":
+        if user is None:
+            await ctx.respond("User required for add.", ephemeral=True)
+            return
+        VC_TIMEOUT_MAP[name] = user.id
+        _save_vc_timeout_map()
+        await ctx.respond(f"Mapped `{name}` -> {user.mention} for voice timeout.")
+    elif action == "remove":
+        if name not in VC_TIMEOUT_MAP:
+            await ctx.respond(f"No mapping for `{name}`.")
+            return
+        del VC_TIMEOUT_MAP[name]
+        _save_vc_timeout_map()
+        await ctx.respond(f"Removed `{name}` from timeout map.")
 
 
 # ---------------------------------------------------------------------------
