@@ -1,0 +1,13 @@
+#Environment
+.env
+.venv/
+__pycache__/
+*.pyc
+default_responses.json
+custom_domains.json
+response_pool.json
+notify_channels.json
+
+#IDE
+.vscode/
+.idea/

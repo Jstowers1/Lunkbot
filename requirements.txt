@@ -1,0 +1,5 @@
+py-cord[voice] @ git+https://github.com/Pycord-Development/pycord@fix/voice-rec-2
+httpx>=0.27
+python-dotenv>=1.0
+SpeechRecognition>=3.10
+edge-tts>=6.1
