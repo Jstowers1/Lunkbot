@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+#Model cache inside /app so lunkbot user can access it.
+ENV HF_HOME=/app/.cache
+
 #Install deps first for layer caching.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
