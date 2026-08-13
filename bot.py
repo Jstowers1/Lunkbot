@@ -157,19 +157,22 @@ _UTTERANCE_TIMEOUT = 0.8  #seconds of silence before an utterance is considered 
 _MIN_UTTERANCE_BYTES = 16000  #ignore tiny blips
 
 #Fuzzy threshold for word-level wake-word matching
-_WAKE_FUZZ_RATIO = 0.72
+_WAKE_FUZZ_RATIO = 0.62
 
 #Target words for fuzzy match
-_WAKE_TARGETS = ("lunkbot", "lunkbots", "lunchbox")
+_WAKE_TARGETS = (
+    "lunkbot", "lunkbots", "lunchbox", "longbot", "longblood",
+    "lunchbots",
+)
+
+
+def _consonant_skeleton(word: str) -> str:
+    """Reduce word to consonants. Catches STT mishears that sound alike."""
+    return re.sub(r"[aeiou]", "", word)
 
 
 def _fuzzy_wake_match(alnum_text: str) -> bool:
-    """Return True if the transcription matches a wake word.
-
-    Two passes:
-    1. Exact substring on phrases and explicit list (handles "hey lunkbot").
-    2. Fuzzy match each word against the core targets via difflib.
-    """
+    """Return True if the transcription matches a wake word."""
     squashed = alnum_text.replace(" ", "")
     for w in WAKE_WORDS:
         if w.replace(" ", "") in squashed:
@@ -180,11 +183,18 @@ def _fuzzy_wake_match(alnum_text: str) -> bool:
         for target in _WAKE_TARGETS:
             if SequenceMatcher(None, word, target).ratio() >= _WAKE_FUZZ_RATIO:
                 return True
+    #ponytail: consonant fallback catches "longbut" -> "lnkbt"
+    for word in words:
+        sk = _consonant_skeleton(word)
+        for target in _WAKE_TARGETS:
+            tgt_sk = _consonant_skeleton(target)
+            if SequenceMatcher(None, sk, tgt_sk).ratio() >= 0.70:
+                return True
     return False
 
 
-_TIMEOUT_KEYWORDS = ("time", "out", "timed")
-_TIMEOUT_NOISE = {"this", "guy", "the", "a", "an"}
+_TIMEOUT_KEYWORDS = ("time", "out", "timed", "timeout")
+_TIMEOUT_NOISE = {"this", "guy", "the", "a", "an", "im", "i", "high", "mount"}
 
 
 def _parse_timeout_target(alnum_text: str) -> int | None:
@@ -194,22 +204,29 @@ def _parse_timeout_target(alnum_text: str) -> int | None:
     """
     words = alnum_text.split()
     has_time = any(w in _TIMEOUT_KEYWORDS for w in words)
-    has_out = "out" in words
-    if not (has_time or has_out):
+    if not has_time:
         return None
 
-    #Filter noise words; anything remaining is a potential name
+    #Filter keywords and noise; anything remaining is a potential name
     candidates = [
         w for w in words
         if w not in _TIMEOUT_KEYWORDS and w not in _TIMEOUT_NOISE
     ]
+    #Exact match
     for w in candidates:
         if w in VC_TIMEOUT_MAP:
             return VC_TIMEOUT_MAP[w]
-    #Fuzzy fallback for misheard names
+    #Fuzzy match
     for w in candidates:
         for name, uid in VC_TIMEOUT_MAP.items():
-            if SequenceMatcher(None, w, name).ratio() >= 0.75:
+            if SequenceMatcher(None, w, name).ratio() >= 0.60:
+                return uid
+    #Consonant skeleton fallback for phonetic mishears
+    for w in candidates:
+        sk = _consonant_skeleton(w)
+        for name, uid in VC_TIMEOUT_MAP.items():
+            tgt_sk = _consonant_skeleton(name)
+            if SequenceMatcher(None, sk, tgt_sk).ratio() >= 0.60:
                 return uid
     return None
 
