@@ -310,19 +310,20 @@ class WakeupSink(Sink):
             print(f"Timeout target {target_id} not found in guild.")
             return
         until = discord.utils.utcnow() + timedelta(seconds=VC_TIMEOUT_DURATION)
-        perms = guild.me.guild_permissions
-        print(
-            f"[TIMEOUT] perms: moderate={perms.moderate_members} "
-            f"manage_roles={perms.manage_roles} "
-            f"bot_top={guild.me.top_role.position} "
-            f"target_top={member.top_role.position}"
-        )
+        if not guild.me.guild_permissions.moderate_members:
+            print("[TIMEOUT] Bot lacks MODERATE_MEMBERS permission.")
+            return
+        if guild.me.top_role <= member.top_role:
+            print(
+                f"[TIMEOUT] Bot role too low: bot={guild.me.top_role} "
+                f"target={member.top_role}"
+            )
+            return
         try:
             await member.timeout(until, reason="Voice command by VC owner.")
-        except discord.Forbidden:
-            print("Missing MODERATE_MEMBERS permission for timeout.")
+            print(f"[TIMEOUT] Timed out {member.display_name} for {VC_TIMEOUT_DURATION}s.")
         except Exception as e:
-            print(f"Timeout failed: {e}")
+            print(f"[TIMEOUT] Failed: {e}")
 
     async def _speak(self, text: str):
         """Generate TTS audio and play it in the VC."""
@@ -405,9 +406,13 @@ def _whisper_transcribe(wav_bytes: bytes) -> str:
             io.BytesIO(wav_bytes),
             language="en",
             beam_size=1,
-            initial_prompt="Hey lunkbot, time out",
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 300},
         )
-        return " ".join(s.text.strip() for s in segments)
+        text = " ".join(s.text.strip() for s in segments)
+        if len(text) < 2:
+            return ""
+        return text
     except Exception as e:
         print(f"Whisper transcribe failed: {e}")
         return ""
