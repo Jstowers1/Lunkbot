@@ -52,7 +52,6 @@ from discord.sinks import Sink, Filters
 from dotenv import load_dotenv
 import edge_tts
 import httpx
-import speech_recognition as sr
 
 import jellyfin_db
 
@@ -311,6 +310,13 @@ class WakeupSink(Sink):
             print(f"Timeout target {target_id} not found in guild.")
             return
         until = discord.utils.utcnow() + timedelta(seconds=VC_TIMEOUT_DURATION)
+        perms = guild.me.guild_permissions
+        print(
+            f"[TIMEOUT] perms: moderate={perms.moderate_members} "
+            f"manage_roles={perms.manage_roles} "
+            f"bot_top={guild.me.top_role.position} "
+            f"target_top={member.top_role.position}"
+        )
         try:
             await member.timeout(until, reason="Voice command by VC owner.")
         except discord.Forbidden:
@@ -348,24 +354,20 @@ class WakeupSink(Sink):
 
 
 def _transcribe_pcm(pcm: bytes) -> str:
-    """Convert raw 48kHz stereo PCM to 16kHz mono WAV, then run Google STT."""
+    """Convert raw 48kHz stereo PCM to mono WAV, then transcribe via faster-whisper."""
     import array
     import wave
-    import struct
 
-    #Pycord delivers 48kHz 16-bit signed stereo PCM
     SAMPLE_RATE = 48000
-    CHANNELS = 2
     SAMPLE_WIDTH = 2
 
-    #Convert bytes to int16 array
     try:
         samples = array.array("h")
         samples.frombytes(pcm)
     except ValueError:
         return ""
 
-    #Downmix stereo to mono: average left and right
+    #Downmix stereo to mono
     mono = []
     for i in range(0, len(samples) - 1, 2):
         mono.append((samples[i] + samples[i + 1]) // 2)
@@ -379,16 +381,35 @@ def _transcribe_pcm(pcm: bytes) -> str:
         wav.setsampwidth(SAMPLE_WIDTH)
         wav.setframerate(SAMPLE_RATE)
         wav.writeframes(array.array("h", mono).tobytes())
-    wav_buf.seek(0)
+    wav_bytes = wav_buf.getvalue()
 
-    recognizer = sr.Recognizer()
-    audio = sr.AudioData(wav_buf.read(), SAMPLE_RATE, SAMPLE_WIDTH)
+    return _whisper_transcribe(wav_bytes)
+
+
+#Lazy-loaded model singleton
+_whisper_model = None
+
+
+def _whisper_transcribe(wav_bytes: bytes) -> str:
+    """Run faster-whisper on a WAV byte buffer. Returns transcript text."""
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        print("[STT] Loading whisper-tiny model...")
+        _whisper_model = WhisperModel(
+            "tiny", device="cpu", compute_type="int8"
+        )
+        print("[STT] Model loaded.")
     try:
-        return recognizer.recognize_google(audio)
-    except sr.UnknownValueError:
-        return ""
-    except sr.RequestError as e:
-        print(f"Google STT request failed: {e}")
+        segments, _info = _whisper_model.transcribe(
+            io.BytesIO(wav_bytes),
+            language="en",
+            beam_size=1,
+            initial_prompt="Hey lunkbot, time out",
+        )
+        return " ".join(s.text.strip() for s in segments)
+    except Exception as e:
+        print(f"Whisper transcribe failed: {e}")
         return ""
 
 

@@ -10,6 +10,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+#Pre-download whisper-tiny model so it doesn't fetch on startup.
+RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('tiny', device='cpu', compute_type='int8')"
+
 #Copy application code.
 COPY jellyfin_db.py bot.py ./
 COPY scripts/ ./scripts/
