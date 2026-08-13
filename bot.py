@@ -41,6 +41,7 @@ import random
 import re
 import time
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -129,8 +130,34 @@ _voice_sink: "WakeupSink | None" = None
 # ---------------------------------------------------------------------------
 
 _SILENCE_BYTES = 3840  #20ms of silence at 48kHz 16-bit stereo = 3840 zero bytes
-_UTTERANCE_TIMEOUT = 2.0  #seconds of silence before an utterance is considered done
+_UTTERANCE_TIMEOUT = 0.8  #seconds of silence before an utterance is considered done
 _MIN_UTTERANCE_BYTES = 16000  #ignore tiny blips
+
+#Fuzzy threshold for word-level wake-word matching
+_WAKE_FUZZ_RATIO = 0.72
+
+#Target words for fuzzy match
+_WAKE_TARGETS = ("lunkbot", "lunkbots", "lunchbox")
+
+
+def _fuzzy_wake_match(alnum_text: str) -> bool:
+    """Return True if the transcription matches a wake word.
+
+    Two passes:
+    1. Exact substring on phrases and explicit list (handles "hey lunkbot").
+    2. Fuzzy match each word against the core targets via difflib.
+    """
+    squashed = alnum_text.replace(" ", "")
+    for w in WAKE_WORDS:
+        if w.replace(" ", "") in squashed:
+            return True
+
+    words = alnum_text.split()
+    for word in words:
+        for target in _WAKE_TARGETS:
+            if SequenceMatcher(None, word, target).ratio() >= _WAKE_FUZZ_RATIO:
+                return True
+    return False
 
 
 class WakeupSink(Sink):
@@ -196,12 +223,10 @@ class WakeupSink(Sink):
         print(f"Voice STT ({user_id}): {text!r}")
         text_lower = text.lower().strip()
 
-        #Wake word check (fuzzy: STT often splits "lunkbot" into "lunk bot")
+        #Wake word check (fuzzy: STT often mishears "lunkbot")
         alnum = re.sub(r"[^a-z0-9 ]", "", text_lower)
-        alnum_squashed = alnum.replace(" ", "")
-        matched = any(
-            w.replace(" ", "") in alnum_squashed for w in WAKE_WORDS
-        )
+        matched = _fuzzy_wake_match(alnum)
+
         if not matched:
             return
 
@@ -318,7 +343,7 @@ async def _silence_checker():
         sink = _voice_sink
         if sink is not None:
             sink.check_silence()
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2)
 
 
 # ---------------------------------------------------------------------------
