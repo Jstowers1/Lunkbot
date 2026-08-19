@@ -1367,8 +1367,13 @@ async def on_message(message: discord.Message):
     pool = _full_pool()
     if not pool:
         return
+    context = ""
+    ref = message.reference
+    if is_reply and ref is not None:
+        #Bot's own message being replied to: scoring context
+        context = getattr(ref.resolved, "content", "") or ""
     if _smart_mode:
-        text = _select_response(message.content, pool, message.channel.id)
+        text = _select_response(message.content, pool, message.channel.id, context)
     else:
         text = random.choice(pool)
     text = _resolve_emojis(text, message.guild)
@@ -1463,12 +1468,18 @@ def _keywords(text: str) -> set[str]:
     }
 
 
+_YN_STARTERS = frozenset({
+    "do", "does", "did", "is", "are", "was", "were", "will", "would", "can",
+    "could", "should", "shall", "has", "have", "had", "am",
+})
+
+
 def _is_yn_question(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped.endswith("?"):
+    """Aux-verb start or trailing ?; wh-words are open questions."""
+    words = re.findall(r"[a-z']+", text.lower())
+    if not words or words[0] in _WH_WORDS:
         return False
-    first = re.findall(r"[a-z]+", stripped.lower())
-    return not (first and first[0] in _WH_WORDS)
+    return text.strip().endswith("?") or words[0] in _YN_STARTERS
 
 
 def _pool_idf(pool: list[str]) -> dict[str, float]:
@@ -1481,9 +1492,10 @@ def _pool_idf(pool: list[str]) -> dict[str, float]:
 
 
 def _pick_side(text: str) -> str | None:
-    """"pizza or tacos?" -> one of the sides, or None."""
+    """"pizza or tacos" -> one of the sides, or None."""
     stripped = text.strip()
-    if not stripped.endswith("?"):
+    #ponytail: word cap keeps statements with a stray "or" out
+    if len(stripped.split()) > 10:
         return None
     parts = [p.strip(" ?.,!") for p in re.split(r"\s+or\s+", stripped, flags=re.IGNORECASE)]
     parts = [p for p in parts if p]
@@ -1499,11 +1511,12 @@ def _pick_side(text: str) -> str | None:
 _MENTION_RE = re.compile(r"<@!?\d+>")
 
 
-def _select_response(message_text: str, pool: list[str], channel_id: int = 0) -> str:
+def _select_response(message_text: str, pool: list[str], channel_id: int = 0, context: str = "") -> str:
     if not pool:
         return ""
 
     message_text = _MENTION_RE.sub("", message_text)
+    context = _MENTION_RE.sub("", context)
     side = _pick_side(message_text)
     if side:
         return side
@@ -1520,7 +1533,9 @@ def _select_response(message_text: str, pool: list[str], channel_id: int = 0) ->
 
     idf = _pool_idf(pool)
     msg_sent = _sentiment(message_text)
-    msg_kw = _keywords(message_text)
+    #Context = bot's own message being replied to. Its stems steer the pick,
+    #sentiment stays on the user's words.
+    msg_kw = _keywords(message_text) | _keywords(context)
 
     recent = _recent_responses.setdefault(channel_id, deque(maxlen=_NO_REPEAT_N))
 
