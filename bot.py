@@ -20,8 +20,10 @@ Background:
   DND "Lunkflix" when down). Updates every 3 min.
   Voice join -> random phrase (VC_JOIN_PHRASES env var) in the notification
   channel. Solo in a voice channel for 10 min -> lonely GIF in the channel.
-  @mention or reply -> response picked by sentiment + keyword match from pool.
+  @mention or reply -> response picked by IDF-weighted keyword match +
+  sentiment distance, no-repeat memory per channel.
   Yes/no questions get a canned yes/no/maybe/idk answer.
+  "a or b?" questions get a side picked.
 
 Voice commands (when bot is in VC):
   "hey lunkbot <anything>" -> speaks a random quote from the pool via TTS.
@@ -40,6 +42,7 @@ import os
 import random
 import re
 import time
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
@@ -143,6 +146,10 @@ _notify_channels: dict[str, int] = {}
 _solo_tasks: dict[int, asyncio.Task] = {}
 _user_responses: list[str] = []
 _smart_mode: bool = True
+
+#No-repeat memory: last N responses per channel get a heavy score penalty
+_NO_REPEAT_N = 8
+_recent_responses: dict[int, deque] = {}
 
 #Voice state: tracks the active Sink and per-user audio buffers
 _voice_sink: "WakeupSink | None" = None
@@ -574,7 +581,8 @@ def _save_user_responses():
 
 
 def _full_pool() -> list[str]:
-    return DEFAULT_RESPONSES + _user_responses
+    #dict.fromkeys dedupes across the two stores, keeps order
+    return list(dict.fromkeys(DEFAULT_RESPONSES + _user_responses))
 
 
 _EMOJI_TOKEN_RE = re.compile(r":([A-Za-z0-9_]+):")
@@ -1360,7 +1368,7 @@ async def on_message(message: discord.Message):
     if not pool:
         return
     if _smart_mode:
-        text = _select_response(message.content, pool)
+        text = _select_response(message.content, pool, message.channel.id)
     else:
         text = random.choice(pool)
     text = _resolve_emojis(text, message.guild)
@@ -1368,7 +1376,7 @@ async def on_message(message: discord.Message):
 
 
 # ---------------------------------------------------------------------------
-# Smart response selection (sentiment + keyword scoring)
+# Smart response selection (IDF keyword match + sentiment + no-repeat)
 # ---------------------------------------------------------------------------
 
 _SENT_POS = frozenset({
@@ -1463,9 +1471,42 @@ def _is_yn_question(text: str) -> bool:
     return not (first and first[0] in _WH_WORDS)
 
 
-def _select_response(message_text: str, pool: list[str]) -> str:
+def _pool_idf(pool: list[str]) -> dict[str, float]:
+    """IDF per stem across the pool. Rare stems discriminate better."""
+    df: Counter = Counter()
+    for resp in pool:
+        df.update(_keywords(resp))
+    n = len(pool)
+    return {s: math.log(n / c) for s, c in df.items()}
+
+
+def _pick_side(text: str) -> str | None:
+    """"pizza or tacos?" -> one of the sides, or None."""
+    stripped = text.strip()
+    if not stripped.endswith("?"):
+        return None
+    parts = [p.strip(" ?.,!") for p in re.split(r"\s+or\s+", stripped, flags=re.IGNORECASE)]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return None
+    #ponytail: last "or" wins; long sides are lead-in sentences, skip them
+    sides = parts[-2:]
+    if any(len(s.split()) > 6 for s in sides):
+        return None
+    return random.choice(sides)
+
+
+_MENTION_RE = re.compile(r"<@!?\d+>")
+
+
+def _select_response(message_text: str, pool: list[str], channel_id: int = 0) -> str:
     if not pool:
         return ""
+
+    message_text = _MENTION_RE.sub("", message_text)
+    side = _pick_side(message_text)
+    if side:
+        return side
 
     if _is_yn_question(message_text):
         mood = _sentiment(message_text)
@@ -1477,8 +1518,11 @@ def _select_response(message_text: str, pool: list[str]) -> str:
             bucket = random.choice(["yes", "no", "maybe", "idk"])
         return random.choice(_YN_ANSWERS[bucket])
 
+    idf = _pool_idf(pool)
     msg_sent = _sentiment(message_text)
     msg_kw = _keywords(message_text)
+
+    recent = _recent_responses.setdefault(channel_id, deque(maxlen=_NO_REPEAT_N))
 
     scored: list[tuple[str, float]] = []
     for resp in pool:
@@ -1488,27 +1532,35 @@ def _select_response(message_text: str, pool: list[str]) -> str:
         sent_dist = abs(msg_sent - r_sent)
         sent_score = (1.0 - sent_dist * sent_dist) * 0.5
 
-        if msg_kw and r_kw:
-            overlap = len(msg_kw & r_kw)
-            kw_score = min(overlap / 3.0, 1.0) * 0.5
+        #IDF-weighted overlap: sharing a rare stem beats sharing a common one
+        total_idf = sum(idf.get(s, 0.0) for s in msg_kw)
+        if msg_kw and r_kw and total_idf > 0:
+            overlap = sum(idf.get(s, 0.0) for s in msg_kw & r_kw)
+            kw_score = min(overlap / total_idf, 1.0) * 0.5
         else:
             kw_score = 0.0
 
-        total = sent_score + kw_score
-        scored.append((resp, total))
+        score = sent_score + kw_score
+        if resp in recent:
+            score -= 1.0  #ponytail: crush repeats, softmax turns this into ~zero
+        scored.append((resp, score))
 
     TEMP = 12.0
     weights = [math.exp(s * TEMP) for _, s in scored]
     total_w = sum(weights)
-    if total_w == 0:
-        return random.choice(pool)
-    r = random.random() * total_w
-    cumulative = 0.0
-    for (resp, _), w in zip(scored, weights):
-        cumulative += w
-        if r <= cumulative:
-            return resp
-    return scored[-1][0]
+    if total_w <= 0:
+        chosen = random.choice(pool)
+    else:
+        r = random.random() * total_w
+        cumulative = 0.0
+        chosen = scored[-1][0]
+        for (resp, _), w in zip(scored, weights):
+            cumulative += w
+            if r <= cumulative:
+                chosen = resp
+                break
+    recent.append(chosen)
+    return chosen
 
 
 # ---------------------------------------------------------------------------
